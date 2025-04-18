@@ -5,7 +5,7 @@
 -- This work is licensed under the terms of GPLv2 (or any later version).
 --
 
-local proto_wg = Proto.new("wg", "WireGuard")
+local proto_wg = Proto.new("wg1", "WireGuard1")
 local type_names = {
     [1] = "Handshake Initiation",
     [2] = "Handshake Response",
@@ -13,23 +13,23 @@ local type_names = {
     [4] = "Transport Data",
 }
 local F = {
-    type        = ProtoField.uint8("wg.type", "Type", base.DEC, type_names),
-    reserved    = ProtoField.none("wg.reserved", "Reserved"),
-    sender      = ProtoField.uint32("wg.sender", "Sender", base.HEX),
-    ephemeral   = ProtoField.bytes("wg.ephemeral", "Ephemeral"),
-    static_data = ProtoField.bytes("wg.static_data", "Static"),
-    timestamp_tai64_label = ProtoField.bytes("wg.timestamp_tai64_label", "TAI64 Label"),
-    timestamp_nano = ProtoField.uint32("wg.timestamp_nano", "Nanoseconds"),
+    type        = ProtoField.uint8("wg1.type", "Type", base.DEC, type_names),
+    reserved    = ProtoField.none("wg1.reserved", "Reserved"),
+    sender      = ProtoField.uint32("wg1.sender", "Sender", base.HEX),
+    ephemeral   = ProtoField.bytes("wg1.ephemeral", "Ephemeral"),
+    static_data = ProtoField.bytes("wg1.static_data", "Static"),
+    timestamp_tai64_label = ProtoField.bytes("wg1.timestamp_tai64_label", "TAI64 Label"),
+    timestamp_nano = ProtoField.uint32("wg1.timestamp_nano", "Nanoseconds"),
     timestamp_value = ProtoField.absolute_time("wg.timestamp_value", "Timestamp", base.UTC),
-    mac1        = ProtoField.bytes("wg.mac1", "mac1"),
-    mac2        = ProtoField.bytes("wg.mac2", "mac2"),
-    receiver    = ProtoField.uint32("wg.receiver", "Receiver", base.HEX),
-    nonce       = ProtoField.bytes("wg.nonce", "Nonce"),
-    cookie      = ProtoField.bytes("wg.cookie", "Cookie"),
-    counter     = ProtoField.uint64("wg.counter", "Counter"),
+    mac1        = ProtoField.bytes("wg1.mac1", "mac1"),
+    mac2        = ProtoField.bytes("wg1.mac2", "mac2"),
+    receiver    = ProtoField.uint32("wg1.receiver", "Receiver", base.HEX),
+    nonce       = ProtoField.bytes("wg1.nonce", "Nonce"),
+    cookie      = ProtoField.bytes("wg1.cookie", "Cookie"),
+    counter     = ProtoField.uint64("wg1.counter", "Counter"),
 }
 local function add_aead_field(F, name, label)
-    F[name] = ProtoField.none("wg." .. name, label .. " (encrypted)")
+    F[name] = ProtoField.none("wg1." .. name, label .. " (encrypted)")
     -- The "empty" field does not have data, do not bother adding fields for it.
     if name ~= "empty" then
         F[name .. "_ciphertext"] = ProtoField.bytes("wg." .. name .. ".ciphertext", "Ciphertext")
@@ -41,6 +41,8 @@ add_aead_field(F, "timestamp", "Timestamp")
 add_aead_field(F, "empty", "Empty")
 add_aead_field(F, "packet", "Packet")
 proto_wg.fields = F
+
+local cipher = GcryptCipher.open(GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_POLY1305, 0)
 
 -- See function load_keys below for the file format.
 proto_wg.prefs.keylog_file = Pref.string("Keylog file", "",
@@ -112,20 +114,7 @@ end
 local function base64_decode(text)
     return ByteArray.new(text, true):base64_decode():raw()
 end
-local gcrypt
-do
-    local ok, res = pcall(require, "luagcrypt")
-    if ok then
-        if res.CIPHER_MODE_POLY1305 then
-            gcrypt = res
-        else
-            report_failure("wg.lua: Libgcrypt 1.7 or newer is required for decryption")
-        end
-    else
-        report_failure("wg.lua: cannot load Luagcrypt, decryption is unavailable.\n" .. res)
-    end
-end
-
+local gcrypt = true
 --
 -- Decryption helpers (independent of Wireshark)
 --
@@ -200,8 +189,8 @@ local function load_key(keylog, filename, key_type, peer_id)
 end
 
 local function decrypt_aead_gcrypt(key, counter, encrypted, aad)
-    local cipher = gcrypt.Cipher(gcrypt.CIPHER_CHACHA20, gcrypt.CIPHER_MODE_POLY1305)
-    cipher:setkey(key)
+    cipher:ctl(GCRYCTL_RESET, ByteArray.new())
+    cipher:setkey(ByteArray.new(key, true))
     local nonce
     if counter == 0 then
         nonce = string.rep("\0", 12)
@@ -209,16 +198,16 @@ local function decrypt_aead_gcrypt(key, counter, encrypted, aad)
         -- UInt64 type was passed in
         nonce = Struct.pack("<I4E", 0, counter)
     end
-    cipher:setiv(nonce)
-    if aad then cipher:authenticate(aad) end
-    local plain = cipher:decrypt(encrypted)
-    return plain, cipher:gettag()
+    cipher:setiv(ByteArray.new(nonce, true))
+    if aad then cipher:authenticate(ByteArray.new(aad, true)) end
+    local plain = cipher:decrypt(nil, encrypted)
+    return plain:raw(), cipher:gettag()
 end
 local function decrypt_aead(key, counter, encrypted, tag, aad)
     local ok, plain, calctag = pcall(decrypt_aead_gcrypt, key, counter, encrypted, aad)
     if ok then
         -- Return result and signal error if authentication failed.
-        local auth_err = calctag ~= tag and "Authentication tag mismatch"
+        local auth_err = tostring(calctag) ~= tostring(tag) and "Authentication tag mismatch"
         return plain, auth_err
     else
         -- Return error
@@ -260,9 +249,9 @@ local function dissect_aead(t, tree, datalen, fieldname, counter, key_type, peer
             end
 
             -- Decrypt and authenticate the buffer
-            local encr_data = encr_tvb and tvb_bytes(encr_tvb) or ""
+            local encr_data = encr_tvb and encr_tvb:bytes() or ""
             local decrypted
-            decrypted, err = decrypt_aead(key, counter, encr_data, tvb_bytes(atag_tvb), aad)
+            decrypted, err = decrypt_aead(key, counter, encr_data, atag_tvb:bytes(), aad)
             -- Skip further processing if authentication tag failed
             if not decrypted or err then break end
 
